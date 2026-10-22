@@ -1,0 +1,134 @@
+[
+ {
+  "id": "1792652579480469",
+  "saved_at": "22 Oct 2026, 12:32",
+  "recipe": {
+   "title": "South Indian Spicy Chicken Masala Pasta",
+   "description": "Tender chicken and pasta coated in a fiery South Indian-style onion, tomato, and chilli spiced sauce enriched with milk and cheese.",
+   "cuisine": "South Indian",
+   "serving": "Serve piping hot alongside fresh cucumber slices.",
+   "difficulty": "Easy",
+   "prep_min": 5,
+   "cook_min": 15,
+   "total_min": 20,
+   "ingredients": [
+    {
+     "name": "Chicken breast (diced)",
+     "quantity": "350 g"
+    },
+    {
+     "name": "Pasta",
+     "quantity": "180 g"
+    },
+    {
+     "name": "Onion (chopped)",
+     "quantity": "100 g"
+    },
+    {
+     "name": "Tomato (chopped)",
+     "quantity": "120 g"
+    },
+    {
+     "name": "Chilli powder",
+     "quantity": "12 g"
+    },
+    {
+     "name": "Milk",
+     "quantity": "150 ml"
+    },
+    {
+     "name": "Cheese (grated)",
+     "quantity": "60 g"
+    },
+    {
+     "name": "Cooking oil",
+     "quantity": "14 g"
+    },
+    {
+     "name": "Salt",
+     "quantity": "5 g"
+    },
+    {
+     "name": "Water",
+     "quantity": "600 ml"
+    }
+   ],
+   "instructions": [
+    {
+     "step": "Bring water to a boil, cook pasta for 7 minutes until tender, then drain.",
+     "heat": "high heat",
+     "timing": "7 min",
+     "tip": "Chop the chicken small while the pasta cooks."
+    },
+    {
+     "step": "Heat cooking oil in a skillet, then fry the chopped onions and tomatoes until softened.",
+     "heat": "medium-high heat",
+     "timing": "2 min",
+     "tip": "Stir frequently to soften tomatoes into a pulp."
+    },
+    {
+     "step": "Add the diced chicken, chilli powder, and salt, stirring until the chicken turns opaque.",
+     "heat": "medium heat",
+     "timing": "3 min",
+     "tip": "Ensure the chilli coats all chicken pieces evenly."
+    },
+    {
+     "step": "Pour in the milk and simmer gently until the chicken is cooked through.",
+     "heat": "medium heat",
+     "timing": "2 min",
+     "tip": "Lower the heat slightly to avoid splitting the milk."
+    },
+    {
+     "step": "Add the drained pasta and cheese, tossing constantly until a smooth sauce coats everything.",
+     "heat": "low heat",
+     "timing": "1 min",
+     "tip": "Take off heat promptly once cheese has melted."
+    }
+   ],
+   "nutrition": {
+    "calories": 535.0,
+    "protein": 45.0,
+    "carbs": 53.0,
+    "fat": 17.0,
+    "fiber": 4.4,
+    "note": "Estimates per serving: the listed ingredient quantities are added up and divided by 3 servings. Real values vary with brands and preparation. Not lab-verified."
+   },
+   "preference_match": [
+    "Muscle gain: about 45 g protein and 535 kcal per serving.",
+    "Non-vegetarian diet: the ingredients were checked against it automatically.",
+    "South Indian cuisine: dish, seasonings and cooking method are styled to match.",
+    "Spice level set to hot.",
+    "Ready in 20 min, within your 20 min limit.",
+    "Written for a beginner cook."
+   ],
+   "gen_seconds": 60.3
+  },
+  "req": {
+   "goal": "💪 Muscle gain",
+   "items": [
+    "CHICKEN",
+    "PASTA",
+    "CHILLI POWDER",
+    "MILK",
+    "CHEESE",
+    "SALT",
+    "onion",
+    "tomato"
+   ],
+   "diet": "Non-vegetarian",
+   "cuisine": "South Indian",
+   "cuisine_mode": "chosen",
+   "cooking_time": 20,
+   "servings": 3,
+   "spice": "Hot",
+   "experience": "Beginner",
+   "allergies": "",
+   "high_protein": false,
+   "indian_food": true,
+   "use_leftovers": false,
+   "available_only": true,
+   "missing_ingredients": "",
+   "inventory": ""
+  }
+ }
+]
