@@ -801,11 +801,17 @@ class NoSuitableRecipe(Exception):
 
 
 def get_api_key():
-    try:
-        key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        return None
-    return key.strip() if isinstance(key, str) and key.strip() else None
+    import os
+
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    if not key:
+        try:
+            key = str(st.secrets.get("GEMINI_API_KEY", "") or "").strip()
+        except Exception:
+            key = ""
+
+    return key or None
 
 
 def _scrub(text: str) -> str:
