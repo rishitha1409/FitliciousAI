@@ -44,6 +44,10 @@ st.session_state.setdefault("page", "Home")                       # Home / My Re
 # Models are tried in order; if one is unavailable (404), overloaded (503) or rate limited (429)
 # after retries, the next one is used. To force a model, add GEMINI_TEXT_MODEL to .streamlit/secrets.toml. Current names: ai.google.dev/gemini-api/docs/models
 def _secret(name: str, default: str = "") -> str:
+    value = os.environ.get(name)
+    if value:
+        return value.strip()
+
     try:
         return str(st.secrets.get(name, default) or default).strip()
     except Exception:
