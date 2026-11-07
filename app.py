@@ -63,11 +63,11 @@ def _model_list(override: str, defaults: list) -> list:
 
 
 TEXT_MODELS = _model_list(
-    _secret("GEMINI_TEXT_MODEL", "gemini-3.8-flash"),
-    ["gemini-3.8-flash"],
+    _secret("GEMINI_TEXT_MODEL"),
+    ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
 )
 NUM_STEPS = 5                     # cooking steps requested from the AI
-MAX_VALIDATION_ATTEMPTS = 3       # regenerate this many times if a recipe breaks the user's rules
+MAX_VALIDATION_ATTEMPTS = 2       # regenerate this many times if a recipe breaks the user's rules
 RETRY_CODES = {429, 500, 502, 503, 504}
 FALLBACK_CODES = {404, 429, 500, 502, 503, 504}
 
@@ -827,12 +827,14 @@ def _short(e: Exception, limit: int = 240) -> str:
     return _scrub(" ".join(str(msg).split()))[:limit]
 
 
-def make_client(api_key: str, timeout_ms: int = 90_000):
+def make_client(api_key: str, timeout_ms: int = 30_000):
     try:
-        return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=timeout_ms),
+        )
     except Exception:
         return genai.Client(api_key=api_key)
-
 
 def _is_network_error(e: Exception) -> bool:
     s = f"{type(e).__name__} {e}".lower()
@@ -1159,8 +1161,8 @@ def generate_text(client, prompt: str) -> str:
                 input=prompt,
                 generation_config={"max_output_tokens": 6000},
             ),
-            tries=3,
-            first_delay=1.5,
+            tries=2,
+            first_delay=0.5,
         )
     except Exception as e:
         raise RecipeError(
