@@ -1,13 +1,20 @@
 import base64
+import functools
 import html
 import io
 import json
 import math
 import os
+import queue
 import random
 import re
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import wave
+from functools import lru_cache
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -29,29 +36,38 @@ WARM_RICE = "#E8E2D6"
 SCALLION_GREEN = "#6F8B3C"
 MISO_TAN = "#D3A275"
 
+# Folder of this file: saved JSON data, the logo and an optional music file live next to app.py.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+
 # ---------- SESSION STATE ----------
-st.session_state.setdefault("recipe_request", None)
+st.session_state.setdefault("recipe_request", None)                  # the "req" dict of the recipe on screen
 st.session_state.setdefault("pending_sound", None)
 st.session_state.setdefault("sound_n", 0)
 st.session_state.setdefault("ingredients", "")
 st.session_state.setdefault("generated_recipe", None)
+st.session_state.setdefault("generated_recipe_image", None)          # (bytes, mime) or None
+st.session_state.setdefault("generated_recipe_image_error", None)    # short reason text if no image
+st.session_state.setdefault("generated_recipe_image_details", [])    # per-model failure log
+st.session_state.setdefault("generated_recipe_image_credit", None)   # unused for Pollinations images
+st.session_state.setdefault("image_pending", False)                  # True = dish photo still to be fetched
 st.session_state.setdefault("recipe_history", [])                    # titles already made (for "another meal")
 st.session_state.setdefault("recipe_id", 0)
-st.session_state.setdefault("page", "Home")                       # Home / My Recipes / Saved Recipes / Settings
+st.session_state.setdefault("page", "Home")                          # Home / My Recipes / Saved Recipes / Settings
 
 
 # ---------- MODEL SETTINGS ----------
-# Models are tried in order; if one is unavailable (404), overloaded (503) or rate limited (429)
-# after retries, the next one is used. To force a model, add GEMINI_TEXT_MODEL to .streamlit/secrets.toml. Current names: ai.google.dev/gemini-api/docs/models
+# Models are tried in order, fastest first. If one is unavailable (404), overloaded (503), rate limited (429)
+# or too slow, the next one is used. To force a model, add GEMINI_TEXT_MODEL to .streamlit/secrets.toml
+# (or set it as an environment variable). Current names: ai.google.dev/gemini-api/docs/models
 def _secret(name: str, default: str = "") -> str:
-    value = os.environ.get(name)
-    if value:
-        return value.strip()
-
+    """Reads .streamlit/secrets.toml first, then an environment variable (needed on Render/Docker)."""
     try:
-        return str(st.secrets.get(name, default) or default).strip()
+        val = st.secrets.get(name, None)
+        if val:
+            return str(val).strip().strip("\"'")
     except Exception:
-        return default
+        pass
+    return str(os.environ.get(name, "") or default).strip().strip("\"'")
 
 
 def _model_list(override: str, defaults: list) -> list:
@@ -62,14 +78,41 @@ def _model_list(override: str, defaults: list) -> list:
     return out
 
 
+_text_override = _secret("GEMINI_TEXT_MODEL")
+
+# gemini-1.x and gemini-2.0 are shut down. (gemini-2.5-* still works, so it is allowed as an override.)
+if re.match(r"^(models/)?gemini-(1\.|2\.0)", _text_override):
+    print(
+        f"[Fitlicious] Ignoring GEMINI_TEXT_MODEL = {_text_override}: "
+        "that model is shut down. Using the default Flash models.",
+        flush=True
+    )
+    _text_override = ""
+
 TEXT_MODELS = _model_list(
-    _secret("GEMINI_TEXT_MODEL"),
-    ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    _text_override,
+    ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash"]
 )
-NUM_STEPS = 5                     # cooking steps requested from the AI
-MAX_VALIDATION_ATTEMPTS = 2       # regenerate this many times if a recipe breaks the user's rules
+
+NUM_STEPS = 5                    # every recipe has EXACTLY this many cooking steps
+MAX_VALIDATION_ATTEMPTS = 2      # 2nd attempt only happens if the 1st recipe broke a diet/allergy/ingredient rule
+
 RETRY_CODES = {429, 500, 502, 503, 504}
-FALLBACK_CODES = {404, 429, 500, 502, 503, 504}
+IMAGE_RETRY_CODES = {500, 502, 503, 504}
+FALLBACK_CODES = {400, 403, 404, 429, 500, 502, 503, 504}   # these move on to the next model
+TEXT_RETRY_CODES = {500, 502, 503, 504}
+
+PER_CALL_TIMEOUT_S = 45          # longest a single Gemini call may take
+ATTEMPT_TIMEOUTS_S = (45, 45, 45)   # HTTP limit for each attempt
+HEDGE_AFTER_S = 6                # no answer yet? start a backup model IN PARALLEL (first good answer wins)
+TOTAL_BUDGET_S = 75              # all attempts for one recipe together; the page never waits longer than this
+HARD_GUARD_GRACE_S = 4           # wall-clock safety net on top of the HTTP timeout (see _call_with_hard_limit)
+RETRY_PAUSE_S = 1.0              # short pause before moving on after a busy/rate-limited answer
+TEXT_TIMEOUT_MS = max(ATTEMPT_TIMEOUTS_S) * 1000     # default for the shared client; every call also sets its own
+MAX_OUTPUT_TOKENS = 2500         # only a ceiling (thinking tokens count too); 5 detailed steps need a little room
+QUICK_MODE = True                # True = short recipe format for every request (fastest). False = full format first.
+FAST_TEXT = True                 # lowest "thinking" level = fastest answers
+
 
 
 # ---------- CUISINES ----------
@@ -207,6 +250,7 @@ TOTAL_FOODS = sum(len(v) for v in FOOD_CATEGORIES.values())
 QUICK_ADD = ["rice", "eggs", "onion", "tomato"]
 
 
+@lru_cache(maxsize=512)
 def emoji_for(item: str) -> str:
     for pattern, emoji in _PATTERNS:
         if pattern.search(item):
@@ -273,8 +317,6 @@ LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 130" role
 <path d="M30 30h9" stroke="#6F8B3C" stroke-width="2.2" stroke-linecap="round"/><circle cx="41" cy="30" r="2.6" fill="#6F8B3C"/>
 </svg>"""
 
-_APP_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
-
 
 @st.cache_data(show_spinner=False)
 def logo_uri() -> str:
@@ -334,8 +376,7 @@ def sound_script(kind: str) -> str:
 
 
 def play_sound_now(kind: str):
-    """Plays right away, in the middle of the run. Browsers only allow sound shortly after a click,
-    so anything that waits until the end of a slow AI call can end up silent."""
+    """Plays right away, in the middle of a run (browsers only allow sound shortly after a click)."""
     if st.session_state.get("sound_effects", True):
         components.html(sound_script(kind), height=0)
 
@@ -442,6 +483,11 @@ def request_another_meal():
     st.session_state.regen_requested = True
 
 
+def request_image_retry():
+    """Button callback: retry only the dish image for the recipe already on screen."""
+    st.session_state.retry_image = True
+
+
 # ---------- FOOD RAIN ANIMATION ----------
 def emoji_rain(emojis, count=26):
     rnd = random.Random(time.time())
@@ -497,6 +543,10 @@ header[data-testid="stHeader"] { background: transparent; }
 footer, #MainMenu { visibility: hidden; }
 
 .block-container { max-width: 1040px; padding-top: 0.8rem; padding-bottom: 3rem; }
+
+/* ---- scrolling: the page and the sidebar scroll on their own, nothing is clipped ---- */
+section[data-testid="stMain"], div[data-testid="stMain"] { overflow-y: auto; }
+section[data-testid="stSidebar"] > div, div[data-testid="stSidebarContent"] { overflow-y: auto; overflow-x: hidden; }
 
 /* ---- top bar / brand ---- */
 .topbar {
@@ -649,6 +699,7 @@ div[data-testid="stPopoverBody"] button[kind="secondary"]:hover { background: va
 /* ---- result cards ---- */
 div[class*="st-key-card_"] { background: var(--paper) !important; border-radius: 22px !important; }
 div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 22px; border-color: var(--line); }
+div[data-testid="stImage"] img { border-radius: 18px; box-shadow: 0 4px 14px rgba(103,58,37,.18); }
 
 .dish-frame {
     position: relative; width: 100%; aspect-ratio: 4 / 3; border-radius: 18px; overflow: hidden;
@@ -801,22 +852,22 @@ class NoSuitableRecipe(Exception):
 
 
 def get_api_key():
-    import os
+    """Gemini key from secrets.toml or from the environment (GEMINI_API_KEY, then GOOGLE_API_KEY)."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        key = _secret(name)
+        if key:
+            return key
+    return None
 
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
 
-    if not key:
-        try:
-            key = str(st.secrets.get("GEMINI_API_KEY", "") or "").strip()
-        except Exception:
-            key = ""
-
-    return key or None
+def get_pollinations_key():
+    """Pollinations secret key from Streamlit secrets or the environment."""
+    return _secret("POLLINATIONS_API_KEY") or None
 
 
 def _scrub(text: str) -> str:
-    """Make sure API keys can never be shown in an error message or log line."""
-    for key in (get_api_key(),):
+    """Make sure the API keys can never be shown in an error message."""
+    for key in (get_api_key(), get_pollinations_key()):
         if key:
             text = text.replace(key, "***")
     return text
@@ -827,14 +878,28 @@ def _short(e: Exception, limit: int = 240) -> str:
     return _scrub(" ".join(str(msg).split()))[:limit]
 
 
-def make_client(api_key: str, timeout_ms: int = 30_000):
+# The client is created once and reused (st.cache_resource), so the secure connection to Google stays warm
+# and every click does not pay the connection set-up time again. SDK-level retries are switched off:
+# this app does its own (fast) fallback to the next model instead of waiting and retrying the same one.
+def _http_options(timeout_ms: int):
     try:
-        return genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(timeout=timeout_ms),
-        )
+        return types.HttpOptions(timeout=timeout_ms, retry_options=types.HttpRetryOptions(attempts=1))
     except Exception:
+        return types.HttpOptions(timeout=timeout_ms)
+
+
+@st.cache_resource(show_spinner=False)
+def _client_for(api_key: str, timeout_ms: int):
+    try:
+        return genai.Client(api_key=api_key, http_options=_http_options(timeout_ms))
+    except Exception as e:
+        print(f"[Fitlicious] WARNING: could not set timeout ({type(e).__name__})", flush=True)
         return genai.Client(api_key=api_key)
+
+
+def make_client(api_key: str, timeout_ms: int = TEXT_TIMEOUT_MS):
+    return _client_for(api_key, timeout_ms)
+
 
 def _is_network_error(e: Exception) -> bool:
     s = f"{type(e).__name__} {e}".lower()
@@ -844,23 +909,22 @@ def _is_network_error(e: Exception) -> bool:
     ))
 
 
-def call_with_retry(fn, tries: int = 4, first_delay: float = 2.0, retry_codes=RETRY_CODES):
-    """Retry temporary failures (HTTP 5xx, optionally 429, network blips) with growing pauses."""
-    delay = first_delay
+# Timeouts are never retried, and the default is 1 try.
+def _is_timeout(e: Exception) -> bool:
+    s = f"{type(e).__name__} {e}".lower()
+    return "timeout" in s or "timed out" in s
+
+
+def call_with_retry(fn, tries: int = 1, first_delay: float = 1.0, retry_codes=RETRY_CODES):
+    """Avoid repeated retries to keep recipe generation faster."""
     for attempt in range(tries):
         try:
             return fn()
-        except genai_errors.APIError as e:
-            if getattr(e, "code", None) in retry_codes and attempt < tries - 1:
-                time.sleep(delay)
-                delay *= 2
-                continue
+        except genai_errors.APIError:
             raise
         except Exception as e:
-            if _is_network_error(e) and attempt < tries - 1:
-                time.sleep(delay)
-                delay *= 2
-                continue
+            if _is_timeout(e) or _is_network_error(e):
+                raise
             raise
 
 
@@ -874,18 +938,24 @@ def friendly_error(e: Exception):
             return ("Gemini rejected your API key or it doesn't have permission for this model. "
                     "Check GEMINI_API_KEY in .streamlit/secrets.toml.", detail)
         if code == 404:
-            return ("That Gemini model isn't available to your API key. "
-                    "Set GEMINI_TEXT_MODEL in secrets.toml to a model from Google's current list.", detail)
+            return ("Every Gemini model we tried is unavailable to your API key (retired or not enabled). "
+                    "Set GEMINI_TEXT_MODEL = \"gemini-3.8-flash\" in .streamlit/secrets.toml, or pick a model "
+                    "from Google's current list.", detail)
         if code == 429:
             return ("You've reached the Gemini rate or quota limit. Wait a minute and try again, "
                     "or check your plan and quota in Google AI Studio.", detail)
         if code in (500, 502, 503, 504):
-            return (f"Google's AI servers are busy right now (HTTP {code}). We retried several times. "
+            return (f"Google's AI servers are busy right now (HTTP {code}). We also tried the backup models. "
                     "Please try again in a minute.", detail)
         if code == 400:
             return ("Gemini couldn't process that request (HTTP 400). Try again, "
                     "or simplify your ingredients and preferences.", detail)
         return (f"Gemini returned an error (HTTP {code}). Please try again.", detail)
+    # a clear message for timeouts (checked before the general network message)
+    if _is_timeout(e):
+        return ("Gemini was too slow to answer, even after we retried with faster backup models. "
+                "Nothing is wrong with your ingredients. Please press the button again; "
+                "it is usually quick once Google's servers recover.", detail)
     if _is_network_error(e):
         return ("Can't reach Google's servers. Check your internet connection, VPN or proxy, "
                 "and that generativelanguage.googleapis.com isn't blocked on your network.", detail)
@@ -1017,7 +1087,8 @@ def _minutes_from(data: dict, number_key: str, text_key: str):
 
 
 def build_preference_match(recipe: dict, req: dict) -> list:
-    """'How this matches your choices' lines, written in code from the real numbers (no extra AI tokens)."""
+    """'How this matches your choices' lines written in code from the real numbers.
+    Only used as a fallback when the AI sent no preference_match lines."""
     n = recipe["nutrition"]
     cal = fmt_nutrient("calories", n["calories"])
     pro = fmt_nutrient("protein", n["protein"])
@@ -1035,7 +1106,7 @@ def build_preference_match(recipe: dict, req: dict) -> list:
         first = (f"Healthy eating: a balanced meal with {fib} fiber per serving."
                  if n["fiber"] is not None else "Healthy eating: a balanced everyday meal.")
     lines = [first, f'{req["diet"]} diet: the ingredients were checked against it automatically.']
-    if req["cuisine_mode"] == "chosen":
+    if req.get("cuisine_mode") == "chosen":
         lines.append(f'{req["cuisine"]} cuisine: dish, seasonings and cooking method are styled to match.')
     else:
         lines.append(f'Cuisine: chosen for you based on your ingredients ({recipe["cuisine"]}).')
@@ -1050,131 +1121,256 @@ def build_preference_match(recipe: dict, req: dict) -> list:
     return lines
 
 
-# ---------- prompt (kept short: fewer tokens = faster answer) ----------
-def build_prompt(req: dict, avoid_titles: list, feedback: str) -> str:
+# ---------- prompt ----------
+def build_prompt(req: dict, avoid_titles: list, feedback: str, compact: bool = False) -> str:
+    """compact=True is the lighter fallback used after a timeout: same rules, but a smaller answer
+    (no tips, 2 summary lines), so it finishes sooner. Both versions always ask for exactly NUM_STEPS steps."""
     if req["diet"] == "Vegetarian":
-        diet_rule = "No chicken, fish, meat, seafood or gelatin. Eggs and dairy are allowed."
+        diet_rule = "no meat, fish, seafood or gelatin; eggs and dairy allowed"
     elif req["diet"] == "Vegan":
-        diet_rule = "No meat, fish, seafood, eggs, dairy, honey or any other animal product."
+        diet_rule = "no animal products at all (no meat, fish, eggs, dairy, honey)"
     else:
-        diet_rule = "Meat, fish and eggs are permitted if appropriate."
-
-    if req["cuisine_mode"] == "chosen":
-        cuisine_line = (
-            f'{req["cuisine"]}. The dish name, spice blend and seasonings, cooking method, flavour profile, '
-            f'cooking steps and serving style must all clearly reflect {req["cuisine"]} cuisine. '
-            "Respect the ingredients, diet and avoid list first; add only a few cuisine-typical extras "
-            "(sauce, spice, herb) if needed."
-        )
-        indian_line = ""
-    else:
-        cuisine_line = "Any - choose the cuisine that suits these ingredients best and name it in the \"cuisine\" field."
-        indian_line = f' | INDIAN STYLE: {req["indian_food"]}'
+        diet_rule = "meat, fish and eggs allowed if appropriate"
 
     avoid_block = ""
     if avoid_titles:
-        avoid_block = (
-            "\nThe user already got these recipes. Make a clearly DIFFERENT dish "
-            "(different main idea and cooking style): " + "; ".join(avoid_titles[-5:]) + "\n"
-        )
-    feedback_block = f"\nYOUR PREVIOUS ATTEMPT WAS REJECTED: {feedback}\nFix this.\n" if feedback else ""
+        avoid_block = ("\nAlready given (make a clearly DIFFERENT dish): "
+                       + "; ".join(avoid_titles[-5:]) + "\n")
+    feedback_block = f"\nPREVIOUS ATTEMPT REJECTED: {feedback} Fix this.\n" if feedback else ""
 
-    return f"""
-You are Fitlicious AI. Create ONE realistic, beginner-friendly recipe built mainly from the user's ingredients.
+    # Only the options that are switched on are sent (less to read, nothing lost).
+    flags = []
+    cuisine_chosen = req.get("cuisine_mode") == "chosen"
+    if cuisine_chosen:
+        flags.append(f'{req["cuisine"]} cuisine (dish name, spices, method and serving style must clearly reflect it)')
+    if req["high_protein"]:
+        flags.append("high protein")
+    if req["indian_food"] and not cuisine_chosen:       # an explicit cuisine choice always wins
+        flags.append("Indian style")
+    if req["use_leftovers"]:
+        flags.append("use up leftovers")
+    if req["available_only"]:
+        flags.append("ONLY the listed ingredients (extras: water, salt, oil, basic spices only)")
+    flags_line = ("- Also: " + "; ".join(flags) + "\n") if flags else ""
 
-INGREDIENTS: {", ".join(req["items"])}
-GOAL: {req["goal"]}
-DIET: {req["diet"]} -> {diet_rule}
-CUISINE: {cuisine_line}
-TIME: prep_minutes + cook_minutes must be {req["cooking_time"]} or less
-SERVINGS: {req["servings"]}
-SPICE: {req["spice"]}
-COOKING EXPERIENCE: {req["experience"]}
-ALLERGIES / AVOID: {req["allergies"] or "None"}
-HIGH PROTEIN: {req["high_protein"]}{indian_line} | USE LEFTOVERS: {req["use_leftovers"]}
-USE ONLY LISTED INGREDIENTS: {req["available_only"]}
-SUBSTITUTE FOR: {req["missing_ingredients"] or "None"}
-INVENTORY / EXPIRY: {req["inventory"] or "None"}
+    step_rule = (f'EXACTLY {NUM_STEPS} instructions for a {req["experience"]} cook, each a clear, specific '
+                 f'1-2 sentence action: "step", "heat" (level/temperature), "timing", and "tip" always "".') if compact else (
+                 f'EXACTLY {NUM_STEPS} instructions for a {req["experience"]} cook, each a clear, specific '
+                 f'1-2 sentence action: "step", "heat" (level/temperature when cooking), "timing", short "tip" (or "").')
+    nutri_shape = "" if compact else ('"nutrition_per_serving":{"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fiber_g":0},\n')
+    match_rule = "preference_match: 2 short lines" if compact else "preference_match: 3-4 short lines"
+    cuisine_field = "" if cuisine_chosen else '"cuisine":"",'
+
+    return f"""Fitlicious AI: create ONE realistic recipe built mainly from the user's ingredients. Reply with minified JSON only (no indentation, no markdown).
+
+USER
+- Ingredients: {", ".join(req["items"])}
+- Goal: {req["goal"]} | Diet: {req["diet"]} ({diet_rule}) | Servings: {req["servings"]}
+- Spice: {req["spice"]} | Experience: {req["experience"]} | Max time: prep_minutes + cook_minutes <= {req["cooking_time"]}
+- Allergies/avoid: {req["allergies"] or "None"}
+{flags_line}- Substitute for: {req["missing_ingredients"] or "None"} | Inventory/expiry notes: {req["inventory"] or "None"}
 {avoid_block}{feedback_block}
 RULES
-- Use the listed ingredients. Add as few extras as possible (water, salt, oil, common spices are fine).
-- Never use anything that conflicts with the diet or the avoid list, even if it is listed: leave it out.
-- If "use only listed ingredients" is True, add only water, salt, oil and basic spices.
-- If no safe recipe is possible, return "title": "No suitable recipe", explain in "description", empty lists.
+- Add as few extras as possible (water, salt, oil, basic spices are free). Never present an unlisted ingredient as available.
+- Never use anything that conflicts with the diet or allergies, even if listed; just leave it out.
+- If no safe recipe is possible: title "No suitable recipe", explain in description, empty lists.
 - Exact quantity for every ingredient, scaled for {req["servings"]} serving(s).
-- For EVERY ingredient give plain numbers (no units, no words) for the WHOLE quantity listed
-  (all {req["servings"]} serving(s) together, not per 100 g): calories, protein_g, carbs_g, fat_g, fiber_g.
-  Use 0 for water and salt. "nutrition_per_serving" = those totals divided by {req["servings"]}.
+- Per ingredient: calories, protein_g, carbs_g, fat_g, fiber_g as plain numbers for the WHOLE listed quantity (no units or words; 0 for water/salt). {'' if compact else 'nutrition_per_serving = totals / ' + str(req['servings']) + '.'}
 - prep_minutes and cook_minutes are whole numbers; step timings must match them.
-- EXACTLY {NUM_STEPS} steps for a {req["experience"]} cook: say exactly what to do, "heat" (e.g. "medium heat"
-  or "180 C") when cooking, "timing" (e.g. "3 min"), and a "tip" of under 12 words (or "").
-- "cuisine" is the cuisine of the dish (one or two words). "serving_suggestion" is one short sentence
-  with an optional garnish or side that fits the cuisine and the diet.
-- difficulty is Easy, Medium or Hard.
+- {step_rule}
+- difficulty: Easy, Medium or Hard. {match_rule} on how it meets goal, diet, spice and time. Keep description and preference_match short; steps stay clear and complete.
 
-Return ONLY JSON in exactly this shape:
-{{
-  "title": "Recipe name",
-  "description": "One appetizing sentence",
-  "cuisine": "Indian",
-  "difficulty": "Easy",
-  "prep_minutes": 5,
-  "cook_minutes": 12,
-  "serving_suggestion": "Serve warm with a squeeze of lemon.",
-  "ingredients": [
-    {{"name": "Rice", "quantity": "100 g", "calories": 130, "protein_g": 2.7, "carbs_g": 28, "fat_g": 0.3, "fiber_g": 0.4}}
-  ],
-  "instructions": [
-    {{"step": "Rinse the rice until the water runs clear.", "heat": "", "timing": "2 min", "tip": "Removes extra starch."}}
-  ],
-  "nutrition_per_serving": {{"calories": 350, "protein_g": 20, "carbs_g": 45, "fat_g": 8, "fiber_g": 6}}
-}}
+JSON shape:
+{{"title":"","description":"",{cuisine_field}"difficulty":"Easy","prep_minutes":5,"cook_minutes":12,
+"ingredients":[{{"name":"","quantity":"","calories":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fiber_g":0}}],
+"instructions":[{{"step":"","heat":"","timing":"","tip":""}}],
+{nutri_shape}"preference_match":[""]}}
 """
 
 
-# ---------- text generation: low "thinking" for speed, retries, model fallback ----------
-def _text_configs() -> list:
-    """Fastest settings first. Models/SDKs that don't accept a thinking setting get the next option."""
-    base = dict(response_mime_type="application/json", temperature=0.7, max_output_tokens=6000)
-    configs = []
-    for thinking in ({"thinking_level": "minimal"}, {"thinking_budget": 0}, None):
-        try:
-            if thinking is None:
-                configs.append(types.GenerateContentConfig(**base))
-            else:
-                configs.append(types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(**thinking), **base))
-        except Exception:
-            continue
-    return configs
-
-
-
-def generate_text(client, prompt: str) -> str:
-    """Generate text using the Gemini Interactions API."""
-    model = _secret("GEMINI_TEXT_MODEL", "gemini-3.8-flash")
-
+# ---------- text generation with model fallback ----------
+# One call per model, a hard time limit on every call, and a total time budget. A slow, retired, busy or
+# rate-limited model moves straight on to the next one. Timing lines are printed in the terminal so you
+# can see which model answered and how long it took.
+def _thinking_config_for(model: str):
+    """Lowest 'thinking' level: Gemini 3.x use a level ('low' is the lowest 3.8 accepts), 2.5 uses a budget."""
+    name = model.replace("models/", "")
     try:
-        response = call_with_retry(
-            lambda: client.interactions.create(
-                model=model,
-                input=prompt,
-                generation_config={"max_output_tokens": 6000},
-            ),
-            tries=2,
-            first_delay=0.5,
-        )
-    except Exception as e:
+        if name.startswith("gemini-2.5"):
+            return types.ThinkingConfig(thinking_budget=0)
+        return types.ThinkingConfig(thinking_level="low")
+    except Exception:
+        print("[Fitlicious] Your google-genai package is too old for thinking_level, so answers will be "
+              "slower. Run: pip install -U google-genai", flush=True)
+        return None
+
+
+class _TextReply:
+    """Same .text attribute as a normal Gemini response."""
+    def __init__(self, text: str):
+        self.text = text
+
+
+def _text_call(client, model: str, prompt: str, fast: bool, timeout_s: float = PER_CALL_TIMEOUT_S):
+    kwargs = {
+        "response_mime_type": "application/json",
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+    }
+    if fast:
+        cfg = _thinking_config_for(model)
+        if cfg is not None:
+            kwargs["thinking_config"] = cfg
+    try:    # per-call time limit (so the last attempt can never run past the total budget)
+        kwargs["http_options"] = types.HttpOptions(timeout=int(max(5.0, timeout_s) * 1000))
+    except Exception:
+        pass
+    return client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(**kwargs),
+    )
+
+
+def _call_with_hard_limit(fn, limit_s: float):
+    """Runs fn() and gives up after limit_s seconds of real time, whatever the network is doing.
+    The HTTP timeout stops a silent connection; this stops everything else (a trickling or half-open
+    connection), so the page can never wait forever. The abandoned worker is a daemon thread, so it
+    cannot keep the app from exiting, and it makes no Streamlit calls."""
+    box = {}
+
+    def runner():
+        try:
+            box["value"] = fn()
+        except BaseException as e:          # re-raised below in the calling thread
+            box["error"] = e
+
+    worker = threading.Thread(target=runner, name="gemini-call", daemon=True)
+    worker.start()
+    worker.join(limit_s)
+    if worker.is_alive():
+        raise TimeoutError(f"Request timed out: Gemini did not answer within {limit_s:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def _is_key_problem(e: Exception) -> bool:
+    text = str(e).lower()
+    return (getattr(e, "code", None) == 401 or "api_key_invalid" in text
+            or "api key not valid" in text or "api key expired" in text)
+
+
+def _reply_text(response) -> str:
+    try:
+        return (response.text or "").strip()
+    except Exception:
+        return ""
+
+
+def _attempt_plan():
+    """One entry per attempt: (model, use_compact_prompt, timeout_s).
+    Fastest model first with the full prompt; if it is slow or busy, the next models get the lighter
+    prompt and more patience; one last attempt goes back to the fastest model with the light prompt."""
+    models = list(TEXT_MODELS)
+    plan = [(m, QUICK_MODE or i > 0, ATTEMPT_TIMEOUTS_S[min(i, len(ATTEMPT_TIMEOUTS_S) - 1)]) for i, m in enumerate(models)]
+    if models:
+        plan.append((models[0], True, ATTEMPT_TIMEOUTS_S[-1]))
+    return plan
+
+
+def generate_text(client, prompt: str, deadline: float = None, compact_prompt: str = None) -> str:
+    """Fastest model first. If it has not answered after HEDGE_AFTER_S seconds (or it fails), the next model
+    is started in parallel with the lighter prompt and the first good answer wins, so one slow model no
+    longer costs the full timeout. Everything stops at the total budget."""
+    plan = _attempt_plan()
+    end_at = deadline or (time.time() + TOTAL_BUDGET_S)
+    box = queue.Queue()
+    state = {"next": 0, "running": 0}
+    dead = set()             # models that answered 404 (retired / not enabled)
+    last = None
+
+    def worker(n, model, text_prompt, timeout_s):
+        started = time.time()
+        try:
+            try:
+                resp = _text_call(client, model, text_prompt, FAST_TEXT, timeout_s)
+            except genai_errors.APIError as e:
+                # 400 can mean "this model rejects the thinking setting": retry once without it.
+                if FAST_TEXT and getattr(e, "code", None) == 400 and not _is_key_problem(e):
+                    resp = _text_call(client, model, text_prompt, False, timeout_s)
+                else:
+                    raise
+            box.put(("ok", model, _reply_text(resp), time.time() - started))
+        except BaseException as e:      # reported to the main loop; the worker makes no Streamlit calls
+            box.put(("err", model, e, time.time() - started))
+
+    def launch():
+        while state["next"] < len(plan):
+            model, use_compact, patience_s = plan[state["next"]]
+            n = state["next"] + 1
+            state["next"] += 1
+            if model in dead:
+                continue
+            remaining = end_at - time.time()
+            if remaining < 8:
+                state["next"] = len(plan)
+                return False
+            timeout_s = min(patience_s, remaining)
+            text_prompt = compact_prompt if (use_compact and compact_prompt) else prompt
+            print(f"[Fitlicious] Attempt {n}: {model} ({'compact' if text_prompt is compact_prompt else 'full'} "
+                  f"prompt, {timeout_s:.0f}s limit)", flush=True)
+            threading.Thread(target=worker, args=(n, model, text_prompt, timeout_s), daemon=True).start()
+            state["running"] += 1
+            return True
+        return False
+
+    if launch():
+        launch()        # race a second model from the very start: the first good answer wins
+    while state["running"] > 0:
+        wait = max(0.1, min(HEDGE_AFTER_S, end_at - time.time()))
+        try:
+            kind, model, payload, took = box.get(timeout=wait)
+        except queue.Empty:
+            if time.time() >= end_at:
+                last = last or TimeoutError(f"Request timed out: no answer within {TOTAL_BUDGET_S}s")
+                break
+            print("[Fitlicious] Still waiting, starting a backup model in parallel...", flush=True)
+            launch()
+            continue
+
+        state["running"] -= 1
+        retry_pause = False
+        if kind == "ok":
+            if payload:
+                print(f"[Fitlicious] {model}: answered in {took:.1f}s", flush=True)
+                return payload
+            last = RecipeError("Gemini returned an empty answer.")
+            print(f"[Fitlicious] {model}: empty response.", flush=True)
+        else:
+            e = payload
+            last = e
+            print(f"[Fitlicious] {model}: {type(e).__name__} after {took:.1f}s", flush=True)
+            if isinstance(e, genai_errors.APIError):
+                code = getattr(e, "code", None)
+                if _is_key_problem(e):
+                    raise e                         # a wrong key fails on every model: stop now
+                if code == 404:
+                    dead.add(model)
+                if code not in FALLBACK_CODES:
+                    raise e
+                retry_pause = code in RETRY_CODES
+            elif not (_is_timeout(e) or _is_network_error(e)):
+                raise e
+        if state["running"] == 0:
+            if retry_pause:
+                time.sleep(RETRY_PAUSE_S)
+            launch()
+
+    if last is None or isinstance(last, RecipeError):
         raise RecipeError(
-            f"Gemini text generation failed using {model}: {e}"
-        ) from e
-
-    text = (response.output_text or "").strip()
-
-    if not text:
-        raise RecipeError("The AI sent back an empty answer.")
-
-    return text
+            "Gemini did not return a recipe in time. Please try again in a moment."
+        )
+    raise last          # friendly_error() turns this into a clear message (quota, key, busy, timeout...)
 
 
 def parse_json_text(raw: str):
@@ -1187,6 +1383,20 @@ def parse_json_text(raw: str):
         if start != -1 and end > start:
             return json.loads(raw[start:end + 1])
         raise
+
+
+def _merge_extra_steps(steps: list) -> list:
+    """Always returns exactly NUM_STEPS steps: if the AI sent more, the extra ones are folded into the last step."""
+    if len(steps) <= NUM_STEPS:
+        return steps
+    head, tail = steps[:NUM_STEPS - 1], steps[NUM_STEPS - 1:]
+    merged = {
+        "step": " ".join(t["step"] for t in tail),
+        "heat": next((t["heat"] for t in tail if t["heat"]), ""),
+        "timing": tail[-1]["timing"] or tail[0]["timing"],
+        "tip": next((t["tip"] for t in tail if t["tip"]), ""),
+    }
+    return head + [merged]
 
 
 def normalize_recipe(data, servings: int) -> dict:
@@ -1225,8 +1435,9 @@ def normalize_recipe(data, servings: int) -> dict:
                 "timing": str(s.get("timing", "")).strip(),
                 "tip": str(s.get("tip", "")).strip(),
             })
-    if len(steps) < 3:
-        raise ValueError("the recipe has too few cooking steps")
+    if len(steps) < NUM_STEPS:
+        raise ValueError(f"the recipe has {len(steps)} cooking steps instead of exactly {NUM_STEPS}")
+    steps = _merge_extra_steps(steps)
 
     prep = _minutes_from(data, "prep_minutes", "prep_time")
     cook = _minutes_from(data, "cook_minutes", "cook_time")
@@ -1245,7 +1456,8 @@ def normalize_recipe(data, servings: int) -> dict:
         "ingredients": ingredients,
         "instructions": steps,
         "nutrition": compute_nutrition(raw_ingredients, data, servings),
-        "preference_match": [],
+        "image_description": str(data.get("image_description", "")).strip(),
+        "preference_match": [str(x).strip() for x in (data.get("preference_match") or []) if str(x).strip()],
     }
 
 
@@ -1361,26 +1573,38 @@ def time_problem(recipe: dict, req: dict) -> str:
     return ""
 
 
+def _finish_recipe(recipe: dict, req: dict) -> dict:
+    """Cuisine label and 'how this matches' lines (the AI's own lines are kept when it sent any)."""
+    if req.get("cuisine_mode") == "chosen":
+        recipe["cuisine"] = req["cuisine"]                  # the user's own cuisine choice always wins
+    else:
+        recipe["cuisine"] = recipe.get("cuisine") or ("Indian" if req.get("indian_food") else "Chef's choice")
+    if not recipe.get("preference_match"):
+        recipe["preference_match"] = build_preference_match(recipe, req)
+    return recipe
+
+
 def create_recipe(client, req: dict, avoid_titles: list) -> dict:
     """Asks Gemini for a recipe, validates it, and regenerates with feedback if it breaks a rule."""
     feedback = ""
     last_problems = []
     last_format_error = ""
     time_fallback = None     # a safe recipe that is only slightly over the time limit
+    deadline = time.time() + TOTAL_BUDGET_S     # total time allowed for all text attempts
     for _ in range(MAX_VALIDATION_ATTEMPTS):
-        raw = generate_text(client, build_prompt(req, avoid_titles, feedback))
+        raw = generate_text(
+            client,
+            build_prompt(req, avoid_titles, feedback),
+            deadline,
+            compact_prompt=build_prompt(req, avoid_titles, feedback, compact=True),
+        )
         try:
             recipe = normalize_recipe(parse_json_text(raw), req["servings"])
         except (json.JSONDecodeError, ValueError) as e:
             last_format_error = str(e)
             feedback = f"the reply was unusable ({last_format_error}). Return only the JSON in the required shape."
             continue
-        # The user's own cuisine choice always wins; for "Surprise me" show the cuisine the AI picked.
-        if req["cuisine_mode"] == "chosen":
-            recipe["cuisine"] = req["cuisine"]
-        else:
-            recipe["cuisine"] = recipe["cuisine"] or "Chef's choice"
-        recipe["preference_match"] = build_preference_match(recipe, req)
+        recipe = _finish_recipe(recipe, req)
 
         problems = validate_recipe(recipe, req)
         t_problem = time_problem(recipe, req)
@@ -1388,9 +1612,7 @@ def create_recipe(client, req: dict, avoid_titles: list) -> dict:
             return recipe
         if not problems:
             recipe["time_warning"] = t_problem
-            time_fallback = recipe
-            feedback = t_problem + ". Shorten the recipe so prep plus cooking fits the limit."
-            continue
+            return recipe           # over the time limit is not a safety issue: show it with a time note, no 2nd request
         last_problems = problems
         last_format_error = ""
         feedback = "; ".join(problems + ([t_problem] if t_problem else [])) + "."
@@ -1408,6 +1630,149 @@ def create_recipe(client, req: dict, avoid_titles: list) -> dict:
         + (f" ({last_format_error})" if last_format_error else "")
         + ". Please try again."
     )
+
+
+# Same ingredients + same preferences + same "already given" list -> same stored recipe, instantly, with no new
+# Gemini request. Only SUCCESSFUL recipes are cached (errors never are), and the key contains every user choice,
+# so different choices can never receive each other's recipe. This also absorbs accidental double clicks:
+# the second click finds the first click's finished recipe in the cache instead of calling Gemini again.
+@st.cache_data(ttl=3600, max_entries=64, show_spinner=False)
+def _cached_recipe(_client, req_key: str, avoid_key: str) -> dict:
+    return create_recipe(_client, json.loads(req_key), json.loads(avoid_key))
+
+
+_SIG_LOCKS = {}
+_SIG_GUARD = threading.Lock()
+
+
+def cached_create_recipe(client, req: dict, avoid_titles: list) -> dict:
+    req_key = json.dumps(req, sort_keys=True, default=str)
+    avoid_key = json.dumps(list(avoid_titles))
+    sig = req_key + "|" + avoid_key
+    with _SIG_GUARD:
+        if len(_SIG_LOCKS) > 200:
+            for k in [k for k, v in _SIG_LOCKS.items() if not v.locked()]:
+                del _SIG_LOCKS[k]
+        lock = _SIG_LOCKS.setdefault(sig, threading.Lock())
+    # An accidental second click with the same choices waits here for the first click's recipe,
+    # then finds it in the cache. Result: ONE Gemini request, not two.
+    with lock:
+        return _cached_recipe(client, req_key, avoid_key)
+
+
+# ---------- DISH IMAGE GENERATION USING POLLINATIONS.AI ----------
+# Uses a server-side secret key. Image generation is separate from Gemini recipe generation.
+POLLINATIONS_IMAGE_URL = "https://gen.pollinations.ai/image/"
+POLLINATIONS_MODEL = "black-forest-labs/flux.1-schnell"
+POLLINATIONS_TIMEOUT_S = 150
+_IMAGE_UA = "FitliciousAI/1.0"
+
+
+class ImageError(Exception):
+    """A dish-image problem we can explain to the user."""
+
+
+def _image_http_get(url: str, headers: dict, timeout: float, max_bytes: int):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": _IMAGE_UA, **headers},
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        data = resp.read(max_bytes + 1)
+
+        if len(data) > max_bytes:
+            raise ImageError("The generated image file was too large.")
+
+        return data, resp.headers.get_content_type()
+
+
+@st.cache_data(ttl=86400, max_entries=128, show_spinner=False)
+def _pollinations_image_cached(title: str, names: tuple, _key: str):
+    """Generate and cache a food image using Pollinations AI."""
+    prompt = (
+        f"Photorealistic professional food photography of {title}, "
+        f"prepared using {', '.join(names)}. "
+        "Beautiful restaurant-quality plating, appetizing textures, "
+        "natural soft lighting, realistic ingredients, highly detailed, "
+        "premium food photography. No text, no watermark."
+    )
+
+    params = urllib.parse.urlencode({
+        "model": POLLINATIONS_MODEL,
+        "width": 1024,
+        "height": 768,
+    })
+    url = (
+        POLLINATIONS_IMAGE_URL
+        + urllib.parse.quote(prompt, safe="")
+        + "?"
+        + params
+    )
+
+    data, mime = _image_http_get(
+        url,
+        {"Authorization": f"Bearer {_key}"},
+        POLLINATIONS_TIMEOUT_S,
+        10_000_000,
+    )
+
+    if not mime.startswith("image/"):
+        raise ImageError("Pollinations did not return a valid image.")
+
+    return data, mime
+
+
+def fetch_dish_image(recipe: dict):
+    """Returns image bytes and metadata; image failures never break the recipe."""
+    key = get_pollinations_key()
+    if not key:
+        return (
+            None,
+            None,
+            "No Pollinations API key found. Add POLLINATIONS_API_KEY to Streamlit secrets.",
+            [],
+            None,
+        )
+
+    names = tuple(item["name"] for item in recipe.get("ingredients", [])[:6])
+    try:
+        data, mime = _pollinations_image_cached(recipe["title"], names, key)
+        return data, mime, None, [], None
+
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            reason = "Pollinations rejected the API key. Check the key and its Image permission."
+        elif e.code == 429:
+            reason = "Pollinations request limit reached. Please try again later."
+        elif e.code == 402:
+            reason = "Pollinations budget or pollen balance is insufficient."
+        else:
+            reason = f"Pollinations returned HTTP {e.code}."
+        return None, None, reason, [f"HTTP error: {e.code}"], None
+
+    except Exception as e:
+        print(f"[Fitlicious] Pollinations image error: {_short(e)}", flush=True)
+        return (
+            None,
+            None,
+            "Pollinations image generation failed. Please try again.",
+            [f"{type(e).__name__}: {_short(e)}"],
+            None,
+        )
+
+
+def store_image_result(data, mime, reason, attempts, credit=None):
+    if data:
+        st.session_state.generated_recipe_image = (data, mime)
+        st.session_state.generated_recipe_image_error = None
+        st.session_state.generated_recipe_image_details = []
+        st.session_state.generated_recipe_image_credit = None
+    else:
+        st.session_state.generated_recipe_image = None
+        st.session_state.generated_recipe_image_error = reason
+        st.session_state.generated_recipe_image_details = attempts
+        st.session_state.generated_recipe_image_credit = None
 
 
 # ---------- downloads ----------
@@ -1449,10 +1814,18 @@ def recipe_to_text(recipe: dict, req: dict) -> str:
     return "\n".join(lines)
 
 
-def recipe_to_html(recipe: dict, req: dict) -> str:
+def recipe_to_html(recipe: dict, req: dict, image=None, credit=None) -> str:
     e = html.escape
     n = recipe["nutrition"]
     img_html = f'<img class="logo" src="{logo_uri()}" alt="Fitlicious AI">'
+    if image:
+        data, mime = image
+        img_html += (f'<img class="dish" src="data:{e(mime)};base64,{base64.b64encode(data).decode()}" '
+                     f'alt="{e(recipe["title"])}">')
+        img_html += (
+            '<p class="note">AI-generated image by '
+            '<a href="https://pollinations.ai">Pollinations.ai</a></p>'
+        )
     ing = "".join(
         f'<li><b>{e(i["name"])}</b>: {e(i["quantity"])}'
         + ("" if in_basket(i["name"], req["items"]) else " <em>(extra)</em>") + "</li>"
@@ -1473,7 +1846,7 @@ def recipe_to_html(recipe: dict, req: dict) -> str:
 <title>{e(recipe["title"])} - Fitlicious AI</title>
 <style>
 body{{font-family:Inter,Arial,Helvetica,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;color:{EARTHEN_BROWN};background:{WARM_RICE}}}
-.logo{{width:110px;height:auto}}
+.logo{{width:110px;height:auto;display:block}} .dish{{width:100%;border-radius:16px;margin-top:10px}}
 h1{{font-family:Poppins,Arial,sans-serif;margin:12px 0 4px}} h2{{font-family:Poppins,Arial,sans-serif;margin-top:26px;color:{SPICY_RED}}}
 .meta{{color:#7A5C4B}} li{{margin:6px 0}} .m{{color:#7A5C4B}} .t{{color:#7A5C4B;font-size:14px}}
 .nutri{{display:flex;flex-wrap:wrap;gap:10px}} .n{{background:#F7F3EA;border:1px solid #CDBFA6;border-radius:12px;padding:10px 14px}}
@@ -1498,53 +1871,100 @@ def _md(text: str) -> str:
     return text.replace("$", "\\$")
 
 
+def show_image(data: bytes, caption: str):
+    try:
+        st.image(data, caption=caption, width="stretch")
+    except Exception:  # older Streamlit versions
+        st.image(data, caption=caption, use_container_width=True)
+
+
 # ---------- the whole "plan a meal" run ----------
 def run_generation(req: dict, avoid_titles: list):
+    print("[DEBUG] run_generation started", flush=True)
+
     api_key = get_api_key()
+
     if not api_key:
-        st.error("No API key found. Add GEMINI_API_KEY to .streamlit/secrets.toml and restart the app.")
+        st.error(
+            "No API key found. Add GEMINI_API_KEY to "
+            ".streamlit/secrets.toml and restart the app."
+        )
         queue_sound("error")
         return
 
-    # Instant feedback on the click (browsers only allow sound right after a click).
-    emoji_rain([emoji_for(i) for i in req["items"]])
-    play_sound_now("success")
+    client = make_client(api_key, TEXT_TIMEOUT_MS)
 
-    client = make_client(api_key)
-    started = time.time()
     try:
-        with st.spinner("👩‍🍳 Creating your personalized recipe..."):
-            recipe = create_recipe(client, req, avoid_titles)
+        _t0 = time.time()
+
+        with st.spinner("👩‍🍳 Cooking up your personalized recipe... this usually takes 10 to 20 seconds. "
+                        "If Google's AI is slow, we automatically retry with a faster backup, so please keep this tab open."):
+            print("[DEBUG] Starting recipe generation", flush=True)
+
+            recipe = cached_create_recipe(client, req, avoid_titles)
+
+            print("[DEBUG] Recipe received from Gemini", flush=True)
+            print("[DEBUG] Recipe title:", recipe.get("title"), flush=True)
+
+        print(
+            f"[Fitlicious] Recipe ready in {time.time() - _t0:.1f}s",
+            flush=True
+        )
+
     except NoSuitableRecipe as e:
+        print(f"[Fitlicious] No suitable recipe: {e}", flush=True)
         st.warning(
             "These ingredients and choices can't make a suitable recipe. "
             + (str(e) or "Try adding more ingredients or relaxing an option.")
         )
         queue_sound("error")
         return
+
     except RecipeError as e:
+        print(f"[Fitlicious] Recipe generation error: {e}", flush=True)
         st.error(str(e))
         queue_sound("error")
         return
+
     except Exception as e:
         message, detail = friendly_error(e)
+        print(
+            f"[Fitlicious] Unexpected recipe error: {type(e).__name__}: {e}",
+            flush=True
+        )
         st.error(message)
         st.caption(f"Technical details: {detail}")
         queue_sound("error")
         return
 
-    recipe["gen_seconds"] = round(time.time() - started, 1)
+    recipe["gen_seconds"] = round(time.time() - _t0, 1)
 
-    # The recipe is valid: save it so the page can show it right away. The picture comes afterwards.
     st.session_state.generated_recipe = recipe
     st.session_state.recipe_history.append(recipe["title"])
     st.session_state.recipe_id += 1   # fresh tick boxes for this new recipe
-    add_to_my_recipes(recipe, req)
+    add_to_my_recipes(recipe, req)    # My Recipes history (saved to JSON)
+
+    # Dish photo: fetched at the bottom of the page AFTER the recipe is on screen, so it never delays the recipe.
+    store_image_result(None, None, None, [])
+    st.session_state.image_pending = True
+
+    emoji_rain([emoji_for(i) for i in req["items"]])
+    queue_sound("success")
+
+
+def run_image_only(recipe: dict):
+    """Retry just the picture for the recipe already on screen."""
+    with st.spinner("✨ Generating your dish image with Pollinations..."):
+        data, mime, reason, attempts, credit = fetch_dish_image(recipe)
+    store_image_result(data, mime, reason, attempts, credit)
+    queue_sound("success" if data else "error")
 
 
 # =====================================================================
 # SAVED DATA, SETTINGS AND NAVIGATION (Home / My Recipes / Saved Recipes / Settings)
 # Saved recipes, history and your default preferences are stored as small JSON files next to app.py.
+# Every entry is {"id", "saved_at", "recipe": {...}, "req": {...}}; "req" is the same dict that is kept in
+# st.session_state.recipe_request while a recipe is on screen.
 # =====================================================================
 MAX_HISTORY = 30
 TIME_OPTIONS = [10, 15, 20, 30, 45, 60]
@@ -1565,6 +1985,12 @@ _RECIPE_KEYS = ("title", "description", "cuisine", "difficulty", "prep_min", "co
                 "ingredients", "instructions", "nutrition", "preference_match")
 _REQ_KEYS = ("goal", "items", "diet", "cuisine", "cuisine_mode", "cooking_time", "servings",
              "spice", "experience", "allergies")
+# Fields that the recipe generator reads from "req". An older saved entry may lack some of them,
+# so they are filled in when an entry is opened (otherwise "Generate another meal" would fail on it).
+REQ_DEFAULTS = {
+    "high_protein": False, "indian_food": False, "use_leftovers": False, "available_only": False,
+    "missing_ingredients": "", "inventory": "",
+}
 
 
 def _data_path(name: str) -> str:
@@ -1695,9 +2121,12 @@ def clear_saved():
 
 
 def open_entry(entry: dict):
+    """Shows a history/saved recipe on the Home page again (its dish photo is fetched after it is displayed)."""
     st.session_state.generated_recipe = entry["recipe"]
-    st.session_state.recipe_request = entry["req"]
+    st.session_state.recipe_request = {**REQ_DEFAULTS, **entry["req"]}
     st.session_state.recipe_id += 1
+    store_image_result(None, None, None, [])        # the old photo belonged to the previous recipe
+    st.session_state.image_pending = True
     st.session_state.page = "Home"
     queue_sound("pop")
 
@@ -1978,9 +2407,9 @@ _LEAF_CSS = """<style>
 .deco,.leaf{position:absolute;display:block;pointer-events:none;background-repeat:no-repeat;background-position:center;background-size:contain;z-index:1}
 .leaf{width:56px;height:56px}
 .lg{background-image:__LG__}.lgf{background-image:__LGF__}.lt{background-image:__LT__}.ltf{background-image:__LTF__}.lr{background-image:__LR__}.lrf{background-image:__LRF__}
-/* header: branch beside the logo, leaf pair mid-header, green swoosh top-right (as in the mockup) */
+/* header: branch beside the logo, leaf pair on the right, green swoosh top-right (as in the mockup) */
 .sprig-l{left:0;top:4px;width:150px;height:110px;background-image:__SPRIG_L__}
-.pair-m{left:47%;top:8px;width:96px;height:84px;background-image:__PAIR__}
+.pair-m{right:34%;top:8px;width:84px;height:76px;background-image:__PAIR__}
 .swoosh{right:0;top:0;bottom:0;width:36%;background-image:__SWOOSH__;background-size:100% 100%}
 .topbar{background:linear-gradient(180deg,#FCF9F2,#F1EADC) !important;box-shadow:inset 0 1px 0 #fff,0 12px 28px -16px rgba(103,58,37,.5),0 2px 6px rgba(103,58,37,.1)}
 .topbar::before,.topbar::after{display:none !important}
@@ -2023,7 +2452,7 @@ div[class*="st-key-card_"]{background:linear-gradient(180deg,#FCF9F3,#F3ECDF) !i
 div[data-baseweb="input"],div[data-baseweb="textarea"],div[data-baseweb="select"] > div{background:linear-gradient(180deg,#F0E9DB,#F8F4EA) !important;box-shadow:inset 0 2px 5px rgba(103,58,37,.14) !important}
 .stApp button[kind="secondary"],.stApp button[data-testid="stBaseButton-secondary"]{background:linear-gradient(180deg,#FFFDF8,#F0E8D8) !important;box-shadow:inset 0 1px 0 #fff,0 3px 6px -2px rgba(103,58,37,.28)}
 .stApp button[kind="primary"],.stApp button[data-testid="stBaseButton-primary"]{background:linear-gradient(180deg,#C93F22,#A93118 55%,#8C2712) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 4px 0 #6E1F0F,0 12px 18px -8px rgba(110,31,15,.6) !important}
-/* ingredient plate: a ceramic plate on a wooden table */
+/* ingredient plate: a ceramic plate on a wooden table (also the placeholder while the dish photo loads) */
 .plate{position:relative;overflow:hidden;border-radius:20px;min-height:270px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:22px 16px;text-align:center;background:repeating-linear-gradient(93deg,rgba(103,58,37,.13) 0 2px,transparent 2px 11px),repeating-linear-gradient(88deg,rgba(255,255,255,.07) 0 1px,transparent 1px 7px),linear-gradient(135deg,#CFA06F,#B9854F 60%,#A8733F);box-shadow:inset 0 2px 10px rgba(60,30,10,.35),0 10px 20px -12px rgba(103,58,37,.6)}
 .plate-dish{position:relative;z-index:2;width:206px;height:206px;max-width:100%;border-radius:50%;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at 34% 28%,#FFFFFF,#F1ECE0 52%,#D6CDB9 100%);box-shadow:0 16px 20px -8px rgba(50,25,8,.6),inset 0 0 0 11px rgba(255,255,255,.65),inset 0 0 0 12px rgba(0,0,0,.07),inset 0 -10px 18px rgba(0,0,0,.08)}
 .plate-emojis{display:flex;flex-wrap:wrap;gap:2px 4px;justify-content:center;align-items:center;font-size:38px;width:150px;filter:drop-shadow(0 4px 3px rgba(60,30,10,.35))}
@@ -2033,6 +2462,8 @@ div[data-baseweb="input"],div[data-baseweb="textarea"],div[data-baseweb="select"
 .plate-cap span{font-size:13px;color:var(--muted)}
 .pl1{left:-12px;top:-12px;width:70px;height:70px;transform:rotate(-20deg)}
 .pl2{right:-10px;bottom:-12px;width:64px;height:64px;transform:rotate(15deg)}
+/* the leaf pair is hidden when the page is too narrow for it to sit clear of the title (sidebar open) */
+@media (max-width:1400px){.pair-m{display:none}}
 @media (max-width:650px){.sprig-l,.pair-m,.swoosh{display:none}.brand{padding-left:0}.ribbon{color:var(--brown) !important;text-shadow:none}.ft-l,.ft-r{width:130px}}
 </style>"""
 for _tok, _val in _ASSETS.items():
@@ -2098,7 +2529,7 @@ st.markdown(
 section(1, "Pick your goal", "Your goal shapes the meals we suggest.")
 goal = st.radio(
     "Choose a fitness goal",
-    ["🔥 Fat loss", "💪 Muscle gain", "💚 Healthy eating"],
+    GOAL_OPTIONS,
     horizontal=True,
     key="w_goal",
     label_visibility="collapsed",
@@ -2196,7 +2627,7 @@ section(3, "Set your preferences", "Tell us how you like to eat and cook.")
 col1, col2 = st.columns(2)
 
 with col1:
-    diet = st.selectbox("🥬 Diet preference", ["Vegetarian", "Non-vegetarian", "Vegan"], key="w_diet")
+    diet = st.selectbox("🥬 Diet preference", DIET_OPTIONS, key="w_diet")
     cuisine_choice = st.selectbox(
         "🌍 Cuisine", CUISINES, key="w_cuisine",
         help="The recipe name, spices, cooking method and serving style follow this cuisine. "
@@ -2209,15 +2640,15 @@ with col1:
         )
     cooking_time = st.select_slider(
         "⏱️ Available cooking time",
-        options=[10, 15, 20, 30, 45, 60],
+        options=TIME_OPTIONS,
         key="w_time",
         format_func=lambda x: f"{x} min",
     )
     servings = st.number_input("🍽️ Number of servings", min_value=1, max_value=10, key="w_servings")
 
 with col2:
-    spice = st.select_slider("🌶️ Spice level", options=["Mild", "Medium", "Hot"], key="w_spice")
-    experience = st.selectbox("👩‍🍳 Cooking experience", ["Beginner", "Intermediate", "Advanced"], key="w_exp")
+    spice = st.select_slider("🌶️ Spice level", options=SPICE_OPTIONS, key="w_spice")
+    experience = st.selectbox("👩‍🍳 Cooking experience", EXPERIENCE_OPTIONS, key="w_exp")
     allergies = st.text_input("⚠️ Allergies or ingredients to avoid", placeholder="e.g. peanuts, dairy", key="w_allergies")
 
 with st.expander("✨ More ways to personalize your meal"):
@@ -2242,6 +2673,7 @@ generate = st.button(
     "✨ Plan my meal", type="primary", use_container_width=True, key="plan_meal_btn"
 )
 regenerate = st.session_state.pop("regen_requested", False)
+retry_image = st.session_state.pop("retry_image", False)
 
 if generate:
     if not items:
@@ -2250,6 +2682,8 @@ if generate:
     else:
         cuisine_label, cuisine_mode = resolve_cuisine(cuisine_choice, custom_cuisine)
         st.session_state.generated_recipe = None
+        store_image_result(None, None, None, [])
+        st.session_state.image_pending = False
         st.session_state.recipe_history = []
         st.session_state.recipe_request = {
             "goal": goal,
@@ -2274,6 +2708,8 @@ elif regenerate and st.session_state.recipe_request:
     # "Generate another meal": same saved preferences and ingredients, a different dish.
     # The current recipe stays on screen if this attempt fails.
     run_generation(st.session_state.recipe_request, list(st.session_state.recipe_history))
+elif retry_image and st.session_state.generated_recipe:
+    st.session_state.image_pending = True    # painted at the bottom of the page, after everything shows
 
 # ---------- 5. MAKE YOUR MEAL ----------
 req = st.session_state.recipe_request
@@ -2283,28 +2719,49 @@ if req and recipe:
     section(5, "Make your meal", "Follow the steps and tick each one off as you go.")
     rid = st.session_state.recipe_id
     nutrition = recipe["nutrition"]
+    image = st.session_state.generated_recipe_image
     goal_text = req["goal"].split(" ", 1)[-1]
     plural = "s" if req["servings"] > 1 else ""
 
-    # ---- hero card: ingredient plate on the left, title and quick facts on the right ----
+    # ---- hero card: dish photo (or ingredient plate) on the left, title and quick facts on the right ----
     with card("hero"):
         plate_col, info_col = st.columns([1, 1.6], gap="large")
         with plate_col:
-            plate_emojis = []
-            for ing in recipe["ingredients"]:
-                em = emoji_for(ing["name"])
-                if em not in plate_emojis:
-                    plate_emojis.append(em)
-            plate_html = "".join(
-                f'<span style="animation-delay:{i * 0.25:.2f}s">{em}</span>' for i, em in enumerate(plate_emojis[:6])
-            )
-            st.markdown(
-                '<div class="plate"><span class="leaf lg pl1"></span><span class="leaf lgf pl2"></span>'
-                f'<div class="plate-dish"><div class="plate-emojis">{plate_html}</div></div>'
-                f'<div class="plate-cap"><b>🌍 {html.escape(recipe["cuisine"])}</b>'
-                f'<span>{len(recipe["ingredients"])} ingredients · {recipe["total_min"]} min</span></div></div>',
-                unsafe_allow_html=True,
-            )
+            if image:
+                show_image(image[0], "Photo for illustration (may not match your exact dish)")
+                st.caption("✨ AI-generated image by Pollinations.ai")
+            else:
+                plate_emojis = []
+                for ing in recipe["ingredients"]:
+                    em = emoji_for(ing["name"])
+                    if em not in plate_emojis:
+                        plate_emojis.append(em)
+                plate_html = "".join(
+                    f'<span style="animation-delay:{i * 0.25:.2f}s">{em}</span>' for i, em in enumerate(plate_emojis[:6])
+                )
+                st.markdown(
+                    '<div class="plate"><span class="leaf lg pl1"></span><span class="leaf lgf pl2"></span>'
+                    f'<div class="plate-dish"><div class="plate-emojis">{plate_html}</div></div>'
+                    f'<div class="plate-cap"><b>🌍 {html.escape(recipe["cuisine"])}</b>'
+                    f'<span>{len(recipe["ingredients"])} ingredients · {recipe["total_min"]} min</span></div></div>',
+                    unsafe_allow_html=True,
+                )
+                if st.session_state.get("image_pending"):
+                    st.info("📸 Your recipe is ready! The dish photo is still loading and will appear here in a moment.")
+                else:
+                    st.caption("🖼️ The dish photo could not be loaded, but your full recipe is below. "
+                               + (st.session_state.generated_recipe_image_error or ""))
+                    details = st.session_state.generated_recipe_image_details
+                    if details:
+                        with st.expander("Why did the image fail? (technical details)"):
+                            for d in details:
+                                st.caption(d)
+                    st.button(
+                        "🔄 Try the image again",
+                        on_click=request_image_retry,
+                        key=f"retry_img_{rid}",
+                        use_container_width=True,
+                    )
         with info_col:
             st.markdown(
                 '<div class="tags">'
@@ -2425,6 +2882,11 @@ if req and recipe:
     with card("save"):
         card_head("💾", "Save your recipe", "", "red")
         slug = _slug(recipe["title"])
+        memo_key = (rid, bool(image))
+        if st.session_state.get("_html_memo_key") != memo_key:
+            st.session_state["_html_memo"] = recipe_to_html(
+                recipe, req, image, st.session_state.generated_recipe_image_credit)
+            st.session_state["_html_memo_key"] = memo_key
         b1, b2, b3, b4 = st.columns(4)
         with b1:
             already = is_saved(recipe)
@@ -2436,7 +2898,7 @@ if req and recipe:
         with b2:
             st.download_button(
                 "⬇️ Download (HTML)",
-                data=recipe_to_html(recipe, req),
+                data=st.session_state["_html_memo"],
                 file_name=f"{slug}.html",
                 mime="text/html",
                 use_container_width=True,
@@ -2453,8 +2915,22 @@ if req and recipe:
             )
         with b4:
             components.html(print_button_html(recipe, req), height=52)
+        if image:
+            ext = "jpg" if "jpeg" in image[1] else "png"
+            st.download_button(
+                "🖼️ Dish image",
+                data=image[0],
+                file_name=f"{slug}.{ext}",
+                mime=image[1],
+                use_container_width=True,
+                key=f"dl_img_{rid}",
+            )
+        else:
+            st.button("🖼️ Dish image (not available)", disabled=True, use_container_width=True, key=f"dl_img_off_{rid}")
         st.caption("Print opens the recipe in a clean new tab (allow pop-ups for this site). "
+                   "Open the downloaded HTML file in any browser to view the recipe with its picture. "
                    "Saved recipes are in the sidebar under Saved Recipes.")
+        # Another meal: same ingredients and preferences, a different dish
         st.button(
             "🔄 Generate another meal",
             on_click=request_another_meal,
@@ -2464,3 +2940,13 @@ if req and recipe:
 
 flush_sound()
 render_footer()
+
+# ---------- DISH PICTURE (runs last, so the recipe and page are already visible) ----------
+if st.session_state.get("image_pending") and st.session_state.generated_recipe:
+    _started = time.time()
+    _data, _mime, _reason, _attempts, _credit = fetch_dish_image(st.session_state.generated_recipe)
+    print(f"[Fitlicious] image step finished in {time.time() - _started:.1f}s "
+          f"({'picture ready' if _data else 'no picture'})", flush=True)
+    store_image_result(_data, _mime, _reason, _attempts, _credit)
+    st.session_state.image_pending = False
+    st.rerun()
